@@ -66,6 +66,8 @@ class Config:
     LOG_FILE = "violations.jsonl"
     BUZZER_PIN = 18
 
+    VIOLATION_CONFIRM_SEC = 3.0  # 3초 이상 지속돼야 알림
+
 
 # COCO keypoint 인덱스
 HEAD_KP     = [0, 1, 2, 3, 4]
@@ -269,27 +271,36 @@ class Buzzer:
 class ViolationAlert:
     def __init__(self):
         os.makedirs(Config.LOG_DIR, exist_ok=True)
-        self._log_path  = os.path.join(Config.LOG_DIR, Config.LOG_FILE)
-        self._cooldowns = {}
-        self._total     = 0
-        self._buzzer    = Buzzer(Config.BUZZER_PIN)
+        self._log_path       = os.path.join(Config.LOG_DIR, Config.LOG_FILE)
+        self._cooldowns      = {}
+        self._first_vio_time = {}   # 추가
+        self._total          = 0
+        self._buzzer         = Buzzer(Config.BUZZER_PIN)
 
     def process(self, person_idx, helmet, vest):
-        """
-        violation 확정 시 호출.
-        쿨다운 중이면 무시 (중복 알림 방지).
-        """
         now = time.time()
+
+        # 처음 violation이면 시각만 기록하고 대기
+        if person_idx not in self._first_vio_time:
+            self._first_vio_time[person_idx] = now
+            return
+
+        # N초 이상 지속됐는지 확인
+        elapsed = now - self._first_vio_time[person_idx]
+        if elapsed < Config.VIOLATION_CONFIRM_SEC:
+            return
+
+        # 쿨다운 확인
         if now - self._cooldowns.get(person_idx, 0) < Config.ALERT_COOLDOWN_SEC:
             return
 
+        # 알림 발령
         self._cooldowns[person_idx] = now
         self._total += 1
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[VIOLATION] {ts} | Person#{person_idx} | H:{helmet} V:{vest}")
 
-        # 로컬 .jsonl 기록
         with open(self._log_path, 'a', encoding='utf-8') as f:
             f.write(json.dumps({
                 "timestamp":  ts,
@@ -298,8 +309,11 @@ class ViolationAlert:
                 "vest":       vest,
             }, ensure_ascii=False) + '\n')
 
-        # 부저
         self._buzzer.beep(0.5)
+
+    def clear_person(self, person_idx):
+        """착용 상태 복귀 시 타이머 리셋"""
+        self._first_vio_time.pop(person_idx, None)
 
     def stats(self):
         return {"total": self._total, "log": self._log_path}
@@ -391,6 +405,8 @@ class PPEEnsemble:
             # [v2] violation 확정 시 알림 처리
             if confirmed_vio:
                 self.alert.process(p_idx, h_st, v_st)
+            else:
+                self.alert.clear_person(p_idx)  # 착용 상태 되면 타이머 리셋
 
             results.append(PersonResult(
                 bbox=p_bbox, helmet=h_st, vest=v_st,
