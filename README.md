@@ -1,208 +1,167 @@
-# On-device AI 기반 건설현장 안전장비 착용 감지 시스템
+"""
+dashboard.py
+관리 PC에서 실행하는 Flask 수신 서버 + 대시보드
 
-> Edge AI PPE (Personal Protective Equipment) Detection System  
-> Raspberry Pi 5 + Hailo AI HAT | YOLOv8n + YOLOv8n-pose Ensemble
+실행:
+    pip install flask
+    python dashboard.py
+    브라우저: http://localhost:5000
+"""
 
----
+from flask import Flask, request, jsonify, render_template_string
+import json
+import os
+from datetime import datetime
+from collections import deque
 
-## 개요
+app = Flask(__name__)
 
-클라우드 서버 없이 Edge Device에서 독립적으로 동작하는 건설현장 안전장비(PPE) 착용 감지 시스템입니다.
+LOG_FILE = "./logs/violations.jsonl"
+os.makedirs("./logs", exist_ok=True)
 
-기존 PPE 탐지 시스템의 한계인 **착용/휴대 구분 불가** 문제를 YOLOv8n Detection + YOLOv8n-pose Ensemble로 해결하며, Raspberry Pi 5 + Hailo AI HAT에서 실시간으로 동작합니다.
+# 최근 50건 메모리에 유지 (대시보드 실시간 표시용)
+recent_events = deque(maxlen=50)
 
----
 
-## 주요 특징
+# ============================================================
+# 대시보드 HTML 템플릿
+# ============================================================
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="5">
+<title>PPE 모니터링 대시보드</title>
+<style>
+  body { font-family: sans-serif; margin: 2rem; background: #f8f8f8; }
+  h1   { font-size: 1.4rem; font-weight: 500; margin-bottom: 1.5rem; }
+  .stats { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
+  .stat  { background: white; border: 1px solid #e0e0e0; border-radius: 8px;
+           padding: 1rem 1.5rem; min-width: 120px; }
+  .stat .num  { font-size: 2rem; font-weight: 500; }
+  .stat .label { font-size: 0.8rem; color: #888; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; background: white;
+          border-radius: 8px; overflow: hidden; border: 1px solid #e0e0e0; }
+  th { background: #f0f0f0; padding: 10px 14px; text-align: left;
+       font-size: 0.85rem; font-weight: 500; }
+  td { padding: 10px 14px; font-size: 0.85rem; border-top: 1px solid #f0f0f0; }
+  .badge { padding: 2px 10px; border-radius: 12px; font-size: 0.78rem; }
+  .worn   { background: #e6f4ea; color: #1e7e34; }
+  .carried { background: #fff3cd; color: #856404; }
+  .nd      { background: #fdecea; color: #b71c1c; }
+  .unknown { background: #f0f0f0; color: #555; }
+  .ts { color: #888; }
+</style>
+</head>
+<body>
+<h1>PPE 모니터링 대시보드</h1>
 
-- **이기종 모델 앙상블** — Detection + Pose Estimation 결합으로 착용/휴대/미착용 3단계 판단
-- **On-device 완결 구조** — 영상이 외부로 나가지 않아 보안 확보, 네트워크 없이도 독립 동작
-- **적응형 추론** — N프레임마다 Pose 실행으로 FPS 손실 최소화
-- **위반 알림** — 지속 시간 기반 확정 + 로컬 로그 + GPIO 부저 경고
+<div class="stats">
+  <div class="stat">
+    <div class="num">{{ total }}</div>
+    <div class="label">총 위반 건수</div>
+  </div>
+  <div class="stat">
+    <div class="num">{{ today }}</div>
+    <div class="label">오늘 위반</div>
+  </div>
+  <div class="stat">
+    <div class="num" style="font-size:1rem;padding-top:0.5rem">{{ last_time }}</div>
+    <div class="label">마지막 위반</div>
+  </div>
+</div>
 
----
+<table>
+  <thead>
+    <tr>
+      <th>시각</th>
+      <th>카메라</th>
+      <th>Person</th>
+      <th>Helmet</th>
+      <th>Vest</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for e in events %}
+    <tr>
+      <td class="ts">{{ e.timestamp }}</td>
+      <td>{{ e.camera_id }}</td>
+      <td>#{{ e.person_idx }}</td>
+      <td>
+        <span class="badge {{ 'worn' if e.helmet=='worn' else ('carried' if e.helmet=='carried' else ('unknown' if e.helmet=='unknown' else 'nd')) }}">
+          {{ e.helmet }}
+        </span>
+      </td>
+      <td>
+        <span class="badge {{ 'worn' if e.vest=='worn' else ('unknown' if e.vest=='unknown' else 'nd') }}">
+          {{ e.vest }}
+        </span>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p style="margin-top:1rem;font-size:0.8rem;color:#aaa">5초마다 자동 새로고침</p>
+</body>
+</html>
+"""
 
-## 하드웨어 구성
 
-| 부품 | 사양 |
-|------|------|
-| SBC | Raspberry Pi 5 8GB |
-| AI 가속기 | Hailo AI HAT (Hailo-8L, 13 TOPS) |
-| 카메라 | Pi Camera Module V2 |
-| 경고 장치 | 부저/스피커 (GPIO) |
+# ============================================================
+# 라즈베리파이에서 POST로 위반 이벤트 수신
+# ============================================================
+@app.route("/log", methods=["POST"])
+def receive_log():
+    data = request.get_json(force=True)
+    if not data:
+        return jsonify({"error": "no data"}), 400
 
----
+    # 메모리에 추가
+    recent_events.appendleft(data)
 
-## 모델 성능
+    # 파일에 기록
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(data, ensure_ascii=False) + '\n')
 
-### Detection (YOLOv8n)
+    print(f"[LOG] {data.get('timestamp')} | "
+          f"Person #{data.get('person_idx')} | "
+          f"H:{data.get('helmet')} V:{data.get('vest')}")
+    return jsonify({"status": "ok"}), 200
 
-| Metric | YOLOv8n | YOLOv10n |
-|--------|---------|----------|
-| mAP@50 | 0.8192 | 0.7977 |
-| mAP@50-95 | 0.4022 | 0.3937 |
-| Precision | 0.8130 | 0.7801 |
-| Recall | 0.7723 | 0.7679 |
 
-### 클래스별 AP@50 (YOLOv8n)
+# ============================================================
+# 대시보드 페이지
+# ============================================================
+@app.route("/")
+def dashboard():
+    events = list(recent_events)
 
-| Class | AP@50 |
-|-------|-------|
-| helmet | 0.8927 |
-| person | 0.8646 |
-| vest | 0.7002 |
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_count = sum(1 for e in events if e.get("timestamp", "").startswith(today_str))
+    last_time = events[0].get("timestamp", "-") if events else "-"
 
-> 동일 데이터셋, 동일 하이퍼파라미터 기준 / YOLOv8n을 메인 모델로 채택
+    # 전체 로그 수 (파일 기준)
+    total = 0
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'r') as f:
+            total = sum(1 for _ in f)
 
----
+    return render_template_string(
+        DASHBOARD_HTML,
+        events=events,
+        total=total,
+        today=today_count,
+        last_time=last_time,
+    )
 
-## 앙상블 판단 로직
 
-```
-카메라 입력
-    ↓
-YOLOv8n Detection (매 프레임)
-    → person / helmet / vest bbox 추출
-    ↓
-YOLOv8n-pose (N프레임마다)
-    → 머리 keypoint (코/눈/귀) 추출
-    → 어깨 keypoint 추출
-    ↓
-매칭 + 판단
-    → helmet: 머리 keypoint 근처 → worn / 하체 → carried / 없음 → not_detected
-    → vest:   어깨 keypoint 근처 → worn / 없음 → not_detected
-    ↓
-Violation 판정 (N초 지속 + 버퍼링)
-    → 부저 경고 + 로컬 로그 기록
-```
+@app.route("/events", methods=["GET"])
+def get_events():
+    """JSON API (선택사항)"""
+    return jsonify(list(recent_events))
 
----
 
-## 파일 구조
-
-```
-ppe_system/
-├── models/
-│   ├── best.pt              # YOLOv8n Detection 가중치
-│   └── yolov8n-pose.pt      # YOLOv8n Pose 가중치
-│   └── *.hef                # Hailo 변환 모델 (HW 도착 후 추가)
-├── detector_v1.py           # 기본 앙상블 로직 (베이스라인)
-├── detector_v2.py           # 개선 버전 (conf 분리, 필터, 알림 포함)
-├── detector.py              # 실행에 사용할 버전 (v1 또는 v2 복사)
-├── visualizer.py            # 시각화
-├── main.py                  # 실행 진입점 (RPi / PC 공통)
-├── dashboard.py             # 관리 PC Flask 서버 (선택사항)
-└── logs/
-    └── violations.jsonl     # 위반 이력 로컬 기록
-```
-
----
-
-## detector 버전 비교
-
-| 기능 | v1 (베이스라인) | v2 (현재) |
-|------|----------------|-----------|
-| Detection conf | 전체 0.4 통일 | 클래스별 분리 (helmet 0.45 / person 0.40 / vest 0.30) |
-| helmet 필터 | 없음 | keypoint 기반 오탐 제거 |
-| Pose IoU 매칭 | 0.5 (엄격) | 0.35 (완화) |
-| 위반 알림 | 없음 | 지속 시간 기반 확정 + 쿨다운 |
-| 로컬 로그 | 없음 | .jsonl 기록 |
-| 부저 | 없음 | RPi GPIO (PC는 콘솔 출력) |
-
----
-
-## 설치 및 실행
-
-### 의존성 설치
-
-```bash
-pip install ultralytics opencv-python requests
-# RPi에서는
-pip install ultralytics opencv-python-headless requests --break-system-packages
-```
-
-### 모델 준비
-
-```
-models/best.pt          ← 학습된 Detection 가중치
-models/yolov8n-pose.pt  ← Ultralytics 자동 다운로드 또는 직접 복사
-```
-
-### 실행할 detector 버전 선택
-
-```bash
-# v2 사용 시
-copy detector_v2.py detector.py   # Windows
-cp detector_v2.py detector.py     # Linux/Mac
-```
-
-### 실행
-
-```bash
-python main.py
-```
-
-종료: `q` 키 또는 `Ctrl+C`
-
----
-
-## 주요 파라미터 (detector_v2.py Config)
-
-| 파라미터 | 기본값 | 설명 |
-|----------|--------|------|
-| `DET_CONF['helmet']` | 0.45 | helmet detection confidence |
-| `DET_CONF['vest']` | 0.30 | vest detection confidence |
-| `POSE_EVERY_N` | 3 | N프레임마다 Pose 실행 |
-| `POSE_IOU_MATCH` | 0.35 | person-pose 매칭 IoU 임계값 |
-| `HELMET_DY_RATIO` | 0.15 | helmet 착용 판정 y 허용 범위 |
-| `VEST_DY_RATIO` | 0.35 | vest 착용 판정 y 허용 범위 |
-| `VIOLATION_BUFFER_N` | 5 | 버퍼 프레임 수 |
-| `VIOLATION_BUFFER_M` | 3 | 위반 확정 최소 프레임 수 |
-| `VIOLATION_CONFIRM_SEC` | 3.0 | 위반 지속 시간 확정 기준 (초) |
-| `ALERT_COOLDOWN_SEC` | 10.0 | 중복 알림 방지 쿨다운 (초) |
-
----
-
-## 학습 환경
-
-| 항목 | 내용 |
-|------|------|
-| 데이터셋 | Roboflow Construction Site Safety (~5,000장) |
-| 클래스 | person / helmet / vest |
-| 학습 환경 | Google Colab (T4 GPU) |
-| Optimizer | AdamW (lr=0.001) |
-| Epochs | 150 (early stopping patience=30) |
-| Export | ONNX opset=13 (Hailo DFC 호환) |
-
----
-
-## Hailo 변환 (HW 도착 후)
-
-```bash
-# ONNX → HEF 변환 (Hailo DFC)
-hailo compile --hw-arch hailo8l --calib-path ./calibration best.onnx
-
-# main.py에서 YOLO() 호출 부분을 HailoRT API로 교체
-```
-
----
-
-## 한계점 및 향후 과제
-
-| 항목 | 내용 |
-|------|------|
-| 밀집 환경 | person-equipment 오매칭 가능 → ByteTrack 트래커 추가로 개선 예정 |
-| 휴대 탐지 | 손에 든 helmet 학습 데이터 부족 → 데이터 보강 예정 |
-| 야간 환경 | Pi Camera V2 저조도 한계 |
-| Hailo 실측 | 현재 수치는 T4 GPU 기준, HW 도착 후 재측정 필요 |
-
----
-
-## 팀 구성
-
-| 이름 | 역할 |
-|------|------|
-| 손민석 | 안전장비 착용·미착용 데이터셋 수집 및 BBox 어노테이션 |
-| 박건우 | 헬멧 휴대(holding) 데이터셋 수집 및 BBox 어노테이션 |
-| 조윤호 | 안전 조끼(vest) 데이터셋 수집 및 BBox 어노테이션 |
-| 홍윤오 | 파이프라인 구성 및 학습 환경 구축, BBox 어노테이션 |
+if __name__ == "__main__":
+    print("대시보드 서버 시작: http://0.0.0.0:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
